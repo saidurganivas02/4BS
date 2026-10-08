@@ -19,6 +19,7 @@ import { useAuth } from '../../context/AuthContext';
 import { useAppointmentModal } from '../../context/AppointmentModalContext';
 import { BrandLogo } from './BrandLogo';
 import { HerbalifeLogo } from './HerbalifeLogo';
+import { BackendConnectionBadge } from './BackendConnectionBadge';
 
 export const Navbar: React.FC = () => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -106,8 +107,10 @@ export const Navbar: React.FC = () => {
             </span>
           </div>
 
-          <div className="flex items-center space-x-5 text-xs">
-            <a href="tel:+919848012345" className="hover:text-white flex items-center gap-1.5 font-semibold text-slate-300 transition">
+          <div className="flex items-center space-x-3 sm:space-x-4 text-xs">
+            <BackendConnectionBadge />
+            <span className="text-slate-700 hidden sm:inline">|</span>
+            <a href="tel:+919848012345" className="hover:text-white hidden sm:flex items-center gap-1.5 font-semibold text-slate-300 transition">
               <PhoneCall className="w-3.5 h-3.5 text-amber-400" />
               <span>Helpline: +91 98480 12345</span>
             </a>

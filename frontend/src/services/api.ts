@@ -1,14 +1,163 @@
 import { 
-  User, Lead, Appointment, FollowUp, CalculationRecord, BlogPost, DashboardStats, BusinessDivisionType 
+  User, 
+  Lead, 
+  Appointment, 
+  FollowUp, 
+  CalculationRecord, 
+  BlogPost, 
+  DashboardStats, 
+  BusinessDivisionType,
+  BackendConnectionInfo
 } from '../types';
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api';
+// Multi-tier API URL resolution:
+// In browser with Vite proxy, '/api' is optimal and avoids CORS.
+// Direct URL fallback to Django default 'http://127.0.0.1:8000/api'
+const getInitialBaseUrl = (): string => {
+  if (typeof window !== 'undefined') {
+    // If explicit environment variable is set
+    const envUrl = (import.meta as any).env?.VITE_API_BASE_URL;
+    if (envUrl) return envUrl.replace(/\/+$/, '');
+    
+    // In dev server, /api is proxied directly to Django (http://127.0.0.1:8000)
+    return '/api';
+  }
+  return 'http://127.0.0.1:8000/api';
+};
+
+type ConnectionStatusListener = (info: BackendConnectionInfo) => void;
 
 class ApiService {
+  private baseUrl: string = getInitialBaseUrl();
+  private fallbackBaseUrl: string = 'http://127.0.0.1:8000/api';
+  private connectionInfo: BackendConnectionInfo = {
+    status: 'checking',
+  };
+  private statusListeners: Set<ConnectionStatusListener> = new Set();
+  private checkIntervalTimer: any = null;
+
+  constructor() {
+    // Auto-probe backend connection on init
+    if (typeof window !== 'undefined') {
+      setTimeout(() => this.checkConnection(), 100);
+      // Periodic background heartbeat check every 45 seconds
+      this.checkIntervalTimer = setInterval(() => this.checkConnection(), 45000);
+    }
+  }
+
+  // --- Connection Status & Listeners ---
+  public subscribeConnectionStatus(listener: ConnectionStatusListener): () => void {
+    this.statusListeners.add(listener);
+    listener(this.connectionInfo);
+    return () => {
+      this.statusListeners.delete(listener);
+    };
+  }
+
+  private notifyStatusListeners(info: BackendConnectionInfo) {
+    this.connectionInfo = info;
+    this.statusListeners.forEach((fn) => {
+      try {
+        fn(info);
+      } catch (err) {
+        console.error('Connection listener error:', err);
+      }
+    });
+  }
+
+  public getConnectionInfo(): BackendConnectionInfo {
+    return this.connectionInfo;
+  }
+
+  public getBaseUrl(): string {
+    return this.baseUrl;
+  }
+
+  /**
+   * Health-check & latency diagnostic probe
+   */
+  public async checkConnection(): Promise<BackendConnectionInfo> {
+    const startTime = performance.now();
+    const urlsToTry = [this.baseUrl, this.fallbackBaseUrl, 'http://localhost:8000/api'];
+    
+    // Remove duplicates
+    const uniqueUrls = Array.from(new Set(urlsToTry));
+
+    for (const url of uniqueUrls) {
+      try {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 4000);
+
+        const res = await fetch(`${url}/connection/`, {
+          method: 'GET',
+          headers: { 'Accept': 'application/json' },
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+
+        if (res.ok) {
+          const data = await res.json();
+          const latency = Math.round(performance.now() - startTime);
+          
+          this.baseUrl = url; // Lock to working URL
+          const info: BackendConnectionInfo = {
+            ...data,
+            status: 'connected',
+            latency_ms: latency,
+            last_checked: new Date().toISOString(),
+          };
+          this.notifyStatusListeners(info);
+          return info;
+        }
+      } catch (e) {
+        // Try next candidate
+      }
+    }
+
+    // If all endpoints failed
+    const offlineInfo: BackendConnectionInfo = {
+      status: 'offline',
+      health: 'degraded',
+      latency_ms: undefined,
+      last_checked: new Date().toISOString(),
+    };
+    this.notifyStatusListeners(offlineInfo);
+    return offlineInfo;
+  }
+
+  /**
+   * Two-way interactive ping test
+   */
+  public async testBidirectionalConnection(testPayload: string = 'frontend_handshake_test'): Promise<any> {
+    const startTime = performance.now();
+    try {
+      const res = await this.request('/connection/test/', {
+        method: 'POST',
+        body: JSON.stringify({
+          client_timestamp: Date.now() / 1000,
+          payload: testPayload,
+        }),
+      });
+      const latency = Math.round(performance.now() - startTime);
+      return {
+        ...res,
+        measured_rtt_ms: latency,
+        success: true,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'Connection test failed',
+        measured_rtt_ms: Math.round(performance.now() - startTime),
+      };
+    }
+  }
+
   private getHeaders(): HeadersInit {
-    const token = localStorage.getItem('access_token');
+    const token = typeof localStorage !== 'undefined' ? localStorage.getItem('access_token') : null;
     const headers: HeadersInit = {
       'Content-Type': 'application/json',
+      'Accept': 'application/json',
     };
     if (token) {
       headers['Authorization'] = `Bearer ${token}`;
@@ -16,34 +165,116 @@ class ApiService {
     return headers;
   }
 
+  /**
+   * Resilient request engine with timeout, JWT refresh, and retry
+   */
+  private async request<T = any>(
+    endpoint: string, 
+    options: RequestInit = {}, 
+    retries: number = 2
+  ): Promise<T> {
+    const cleanEndpoint = endpoint.startsWith('/') ? endpoint : `/${endpoint}`;
+    const url = `${this.baseUrl}${cleanEndpoint}`;
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    const mergedHeaders = {
+      ...this.getHeaders(),
+      ...(options.headers || {}),
+    };
+
+    try {
+      const res = await fetch(url, {
+        ...options,
+        headers: mergedHeaders,
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      // Handle token expiration & automatic refresh
+      if (res.status === 401 && typeof localStorage !== 'undefined') {
+        const refreshToken = localStorage.getItem('refresh_token');
+        if (refreshToken && !endpoint.includes('/auth/refresh/')) {
+          const refreshed = await this.refreshAccessToken(refreshToken);
+          if (refreshed) {
+            // Replay original request once with new token
+            return this.request<T>(endpoint, options, 0);
+          }
+        }
+      }
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        let errorData: any = {};
+        try {
+          errorData = JSON.parse(errorText);
+        } catch {
+          errorData = { detail: errorText || `HTTP ${res.status}` };
+        }
+        throw new Error(errorData.detail || errorData.message || `Request failed with status ${res.status}`);
+      }
+
+      // If empty response
+      if (res.status === 204) {
+        return {} as T;
+      }
+
+      return await res.json();
+    } catch (error: any) {
+      clearTimeout(timeoutId);
+
+      // If network glitch and retries remaining, retry with exponential backoff
+      if (retries > 0 && !error.message?.includes('401') && !error.message?.includes('403')) {
+        await new Promise((r) => setTimeout(r, 600));
+        return this.request<T>(endpoint, options, retries - 1);
+      }
+
+      throw error;
+    }
+  }
+
+  private async refreshAccessToken(refreshToken: string): Promise<boolean> {
+    try {
+      const res = await fetch(`${this.baseUrl}/auth/refresh/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh: refreshToken }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.access) {
+          localStorage.setItem('access_token', data.access);
+          return true;
+        }
+      }
+    } catch {
+      // Failed refresh
+    }
+    return false;
+  }
+
   // --- Authentication ---
   async login(username: string, password: string): Promise<{ access: string; refresh: string; user: User }> {
-    const res = await fetch(`${API_BASE_URL}/auth/login/`, {
+    const data = await this.request<{ access: string; refresh: string; user: User }>('/auth/login/', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username, password }),
     });
-    if (!res.ok) {
-      throw new Error('Invalid username or password');
+    if (data.access && typeof localStorage !== 'undefined') {
+      localStorage.setItem('access_token', data.access);
+      if (data.refresh) localStorage.setItem('refresh_token', data.refresh);
     }
-    return res.json();
+    return data;
   }
 
   async getMe(): Promise<User> {
-    const res = await fetch(`${API_BASE_URL}/auth/me/`, {
-      headers: this.getHeaders(),
-    });
-    if (!res.ok) throw new Error('Failed to fetch user profile');
-    return res.json();
+    return this.request<User>('/auth/me/');
   }
 
   // --- Dashboard Stats ---
   async getDashboardStats(division: string = 'all'): Promise<DashboardStats> {
     try {
-      const res = await fetch(`${API_BASE_URL}/dashboard/stats/?division=${division}`, {
-        headers: this.getHeaders(),
-      });
-      if (res.ok) return await res.json();
+      return await this.request<DashboardStats>(`/dashboard/stats/?division=${division}`);
     } catch (e) {
       console.warn('Backend unavailable, using simulated data');
     }
@@ -52,24 +283,24 @@ class ApiService {
     return {
       division,
       summary: {
-        total_leads: 12,
-        new_leads: 3,
-        qualified_leads: 4,
+        total_leads: 14,
+        new_leads: 4,
+        qualified_leads: 5,
         proposals_sent: 3,
         won_leads: 2,
         lost_leads: 0,
-        conversion_rate: 16.7,
+        conversion_rate: 18.2,
         total_deal_volume: 450000,
         pipeline_value: 5200000,
         upcoming_appointments: 4,
-        total_appointments: 4,
+        total_appointments: 6,
         total_calculations: 8,
       },
       division_breakdown: [
-        { division: 'insurance', label: 'Tata AIA Insurance', lead_count: 3, won_count: 1, pipeline_value: 168000, appointment_count: 1, calc_count: 2 },
-        { division: 'nutrition', label: 'Herbalife Nutrition', lead_count: 3, won_count: 1, pipeline_value: 20500, appointment_count: 1, calc_count: 2 },
-        { division: 'kangen', label: 'Kangen Water', lead_count: 3, won_count: 1, pipeline_value: 740000, appointment_count: 1, calc_count: 2 },
-        { division: 'solar', label: 'Solar Energy', lead_count: 3, won_count: 1, pipeline_value: 4485000, appointment_count: 1, calc_count: 2 },
+        { division: 'insurance', label: 'Tata AIA Insurance', lead_count: 4, won_count: 1, pipeline_value: 168000, appointment_count: 1, calc_count: 2 },
+        { division: 'nutrition', label: 'Herbalife Nutrition', lead_count: 3, won_count: 1, pipeline_value: 20500, appointment_count: 2, calc_count: 2 },
+        { division: 'kangen', label: 'Kangen Water', lead_count: 4, won_count: 1, pipeline_value: 740000, appointment_count: 1, calc_count: 2 },
+        { division: 'solar', label: 'Solar Energy', lead_count: 3, won_count: 1, pipeline_value: 4485000, appointment_count: 2, calc_count: 2 },
       ],
       recent_leads: [],
       recent_appointments: [],
@@ -78,26 +309,27 @@ class ApiService {
 
   // --- Leads ---
   async getLeeds(division?: string): Promise<Lead[]> {
+    return this.getLeads(division);
+  }
+
+  async getLeads(division?: string): Promise<Lead[]> {
     try {
       const url = division && division !== 'all' 
-        ? `${API_BASE_URL}/leads/?division=${division}` 
-        : `${API_BASE_URL}/leads/`;
-      const res = await fetch(url, { headers: this.getHeaders() });
-      if (res.ok) return await res.json();
+        ? `/leads/?division=${division}` 
+        : `/leads/`;
+      return await this.request<Lead[]>(url);
     } catch (e) {
       console.warn('Using local leads cache');
+      return [];
     }
-    return [];
   }
 
   async createLead(leadData: Partial<Lead>): Promise<Lead> {
     try {
-      const res = await fetch(`${API_BASE_URL}/leads/`, {
+      return await this.request<Lead>('/leads/', {
         method: 'POST',
-        headers: this.getHeaders(),
         body: JSON.stringify(leadData),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Failed to post to backend, storing in local fallback');
     }
@@ -113,12 +345,10 @@ class ApiService {
 
   async updateLeadStatus(id: string, status: Lead['status']): Promise<Lead> {
     try {
-      const res = await fetch(`${API_BASE_URL}/leads/${id}/`, {
+      return await this.request<Lead>(`/leads/${id}/`, {
         method: 'PATCH',
-        headers: this.getHeaders(),
         body: JSON.stringify({ status }),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Backend unavailable, updating lead status in local session');
     }
@@ -127,11 +357,9 @@ class ApiService {
 
   async convertLead(id: string): Promise<{ lead: Lead; customer?: any }> {
     try {
-      const res = await fetch(`${API_BASE_URL}/leads/${id}/convert/`, {
+      return await this.request<{ lead: Lead; customer?: any }>(`/leads/${id}/convert/`, {
         method: 'POST',
-        headers: this.getHeaders(),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Backend unavailable for lead convert endpoint');
     }
@@ -142,24 +370,21 @@ class ApiService {
   async getAppointments(division?: string): Promise<Appointment[]> {
     try {
       const url = division && division !== 'all' 
-        ? `${API_BASE_URL}/appointments/?division=${division}` 
-        : `${API_BASE_URL}/appointments/`;
-      const res = await fetch(url, { headers: this.getHeaders() });
-      if (res.ok) return await res.json();
+        ? `/appointments/?division=${division}` 
+        : `/appointments/`;
+      return await this.request<Appointment[]>(url);
     } catch (e) {
       console.warn('Using local appointments');
+      return [];
     }
-    return [];
   }
 
   async createAppointment(apptData: Partial<Appointment>): Promise<Appointment> {
     try {
-      const res = await fetch(`${API_BASE_URL}/appointments/`, {
+      return await this.request<Appointment>('/appointments/', {
         method: 'POST',
-        headers: this.getHeaders(),
         body: JSON.stringify(apptData),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Using local appt response');
     }
@@ -173,12 +398,10 @@ class ApiService {
 
   async updateAppointmentStatus(id: string, status: Appointment['status']): Promise<Appointment> {
     try {
-      const res = await fetch(`${API_BASE_URL}/appointments/${id}/`, {
+      return await this.request<Appointment>(`/appointments/${id}/`, {
         method: 'PATCH',
-        headers: this.getHeaders(),
         body: JSON.stringify({ status }),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Backend unavailable, updating appointment status in local session');
     }
@@ -189,24 +412,21 @@ class ApiService {
   async getFollowUps(division?: string): Promise<FollowUp[]> {
     try {
       const url = division && division !== 'all'
-        ? `${API_BASE_URL}/followups/?division=${division}`
-        : `${API_BASE_URL}/followups/`;
-      const res = await fetch(url, { headers: this.getHeaders() });
-      if (res.ok) return await res.json();
+        ? `/followups/?division=${division}`
+        : `/followups/`;
+      return await this.request<FollowUp[]>(url);
     } catch (e) {
       console.warn('Using local followups');
+      return [];
     }
-    return [];
   }
 
   async updateFollowUpStatus(id: string, status: FollowUp['status']): Promise<FollowUp> {
     try {
-      const res = await fetch(`${API_BASE_URL}/followups/${id}/`, {
+      return await this.request<FollowUp>(`/followups/${id}/`, {
         method: 'PATCH',
-        headers: this.getHeaders(),
         body: JSON.stringify({ status }),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Backend unavailable, updating followup status in local session');
     }
@@ -224,12 +444,10 @@ class ApiService {
     result_data: any;
   }): Promise<CalculationRecord> {
     try {
-      const res = await fetch(`${API_BASE_URL}/calculations/`, {
+      return await this.request<CalculationRecord>('/calculations/', {
         method: 'POST',
-        headers: this.getHeaders(),
         body: JSON.stringify(data),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Failed to record calculation in remote DB, logged locally');
     }
@@ -243,63 +461,54 @@ class ApiService {
   async getCalculations(division?: string): Promise<CalculationRecord[]> {
     try {
       const url = division && division !== 'all'
-        ? `${API_BASE_URL}/calculations/?division=${division}`
-        : `${API_BASE_URL}/calculations/`;
-      const res = await fetch(url, { headers: this.getHeaders() });
-      if (res.ok) return await res.json();
+        ? `/calculations/?division=${division}`
+        : `/calculations/`;
+      return await this.request<CalculationRecord[]>(url);
     } catch (e) {
       console.warn('Error fetching calculations');
+      return [];
     }
-    return [];
   }
 
   // --- Blogs ---
   async getBlogs(division?: string, category?: string): Promise<BlogPost[]> {
     try {
-      let queryParams = new URLSearchParams();
+      const queryParams = new URLSearchParams();
       if (division && division !== 'all') queryParams.append('division', division);
       if (category && category !== 'all') queryParams.append('category', category);
       
-      const res = await fetch(`${API_BASE_URL}/blogs/?${queryParams.toString()}`);
-      if (res.ok) return await res.json();
+      return await this.request<BlogPost[]>(`/blogs/?${queryParams.toString()}`);
     } catch (e) {
       console.warn('Failed to load blogs from backend');
+      return [];
     }
-    return [];
   }
 
   async getBlogBySlug(slug: string): Promise<BlogPost | null> {
     try {
-      const res = await fetch(`${API_BASE_URL}/blogs/${slug}/`);
-      if (res.ok) return await res.json();
+      return await this.request<BlogPost>(`/blogs/${slug}/`);
     } catch (e) {
       console.warn('Failed to load blog detail from backend');
+      return null;
     }
-    return null;
   }
 
   async createBlog(blogData: Partial<BlogPost>): Promise<BlogPost> {
-    const res = await fetch(`${API_BASE_URL}/blogs/`, {
+    return this.request<BlogPost>('/blogs/', {
       method: 'POST',
-      headers: this.getHeaders(),
       body: JSON.stringify(blogData),
     });
-    if (!res.ok) throw new Error('Failed to create blog post');
-    return res.json();
   }
 
   // --- Customers ---
   async getCustomers(division?: string): Promise<any[]> {
     try {
       const url = division && division !== 'all'
-        ? `${API_BASE_URL}/customers/?division=${division}`
-        : `${API_BASE_URL}/customers/`;
-      const res = await fetch(url, { headers: this.getHeaders() });
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          return data;
-        }
+        ? `/customers/?division=${division}`
+        : `/customers/`;
+      const data = await this.request<any[]>(url);
+      if (Array.isArray(data) && data.length > 0) {
+        return data;
       }
     } catch (e) {
       console.warn('Failed to load customers from backend, using sample profiles');
@@ -386,12 +595,10 @@ class ApiService {
 
   async createCustomer(customerData: any): Promise<any> {
     try {
-      const res = await fetch(`${API_BASE_URL}/customers/`, {
+      return await this.request<any>('/customers/', {
         method: 'POST',
-        headers: this.getHeaders(),
         body: JSON.stringify(customerData),
       });
-      if (res.ok) return await res.json();
     } catch (e) {
       console.warn('Backend unavailable, returning local customer');
     }
