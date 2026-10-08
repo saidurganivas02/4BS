@@ -1,0 +1,17 @@
+{
+  "name": "quadrabiz-all-in-one-platform",
+  "version": "1.0.0",
+  "description": "Multi-business platform for Tata AIA Insurance, Herbalife Nutrition, Kangen Water, and Solar Rooftop EPC",
+  "scripts": {
+    "dev": "concurrently -n \"BACKEND,FRONTEND\" -c \"blue,green\" \"npm run dev:backend\" \"npm run dev:frontend\"",
+    "dev:frontend": "npm run dev --prefix frontend",
+    "dev:backend": ".\\venv\\Scripts\\python.exe manage.py runserver 127.0.0.1:8000",
+    "build": "npm run build --prefix frontend",
+    "install:all": "npm install && npm install --prefix frontend && .\\venv\\Scripts\\pip install -r requirements.txt",
+    "seed": ".\\venv\\Scripts\\python.exe manage.py seed_data",
+    "migrate": ".\\venv\\Scripts\\python.exe manage.py migrate"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
